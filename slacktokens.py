@@ -91,11 +91,20 @@ def get_tokens_and_cookie():
   """Return a dictionary containing the Slack personal tokens and cookie."""
   return { 'tokens': get_tokens(), 'cookie': get_cookie() }
 
-def get_tokens():
-  """Return a dictionary containing the token and name for each Slack Workspace."""
+def get_tokens(use_copy=True):
+  """Return a dictionary containing the token and name for each Slack Workspace.
+
+  Args:
+    use_copy: If True (default), copy the LevelDB to a temporary directory
+              before opening it and delete the copy afterwards. This avoids
+              lock conflicts when Slack is running. Set to False to open the
+              live database directly, which requires Slack to be quit first.
+  """
   import leveldb
   import sys
   import pathlib
+  import shutil
+  import tempfile
 
   if sys.platform == "darwin":
     # leveldb location in MacOS depends on whether the application was installed from
@@ -108,9 +117,19 @@ def get_tokens():
   else:
     raise OSError("slacktokens only works on macOS or Linux.")
 
+  src = pathlib.Path(LEVELDB_PATH).expanduser()
+  tmpdir = None
+
+  if use_copy:
+    tmpdir = tempfile.mkdtemp(prefix="slacktokens-")
+    db_path = pathlib.Path(tmpdir) / src.name
+    shutil.copytree(src, db_path)
+  else:
+    db_path = src
+
   db = None
   try:
-    db = leveldb.LevelDB(str(pathlib.Path(LEVELDB_PATH).expanduser()))
+    db = leveldb.LevelDB(str(db_path))
   except Exception as e:
     if "lock" in str(e):
       raise RuntimeError("Slack's Local Storage database appears to be locked. Have you quit Slack?") from e
@@ -127,15 +146,16 @@ def get_tokens():
     except Exception as e:
       raise RuntimeError("Slack's Local Storage not recognised: localConfig not in expected format. Aborting.") from e
 
-
     tokens = {}
     for v in d['teams'].values():
       tokens[v['url']] = { 'token': v['token'], 'name': v['name'] }
-  
+
     return tokens
   finally:
     if db:
       del db # attempt to clean up our lock
+    if tmpdir:
+      shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def get_cookie():
