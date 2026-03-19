@@ -91,32 +91,56 @@ def get_tokens_and_cookie():
   """Return a dictionary containing the Slack personal tokens and cookie."""
   return { 'tokens': get_tokens(), 'cookie': get_cookie() }
 
-def get_tokens():
-  """Return a dictionary containing the token and name for each Slack Workspace."""
-  import leveldb
+def _default_leveldb_path():
+  """Return the default platform-specific path to Slack's LevelDB directory."""
   import sys
   import pathlib
 
   if sys.platform == "darwin":
-    # leveldb location in MacOS depends on whether the application was installed from
-    # the App Store or direct download. To find out, we simply check for existence.
-    LEVELDB_PATH='~/Library/Application Support/Slack/Local Storage/leveldb'
-    if not pathlib.Path(LEVELDB_PATH).expanduser().exists():
-      LEVELDB_PATH='~/Library/Containers/com.tinyspeck.slackmacgap/Data/Library/Application Support/Slack/Local Storage/leveldb'
+    path = pathlib.Path('~/Library/Application Support/Slack/Local Storage/leveldb').expanduser()
+    if not path.exists():
+      path = pathlib.Path('~/Library/Containers/com.tinyspeck.slackmacgap/Data/Library/Application Support/Slack/Local Storage/leveldb').expanduser()
+    return path
   elif sys.platform.startswith("linux"):
-    LEVELDB_PATH='~/.config/Slack/Local Storage/leveldb'
+    return pathlib.Path('~/.config/Slack/Local Storage/leveldb').expanduser()
   else:
     raise OSError("slacktokens only works on macOS or Linux.")
 
+def get_tokens(copy_if_locked=True):
+  """Return a dictionary containing the token and name for each Slack Workspace.
+
+  Args:
+    copy_if_locked: If True (default), automatically copy the LevelDB to a
+                    temporary directory and read from the copy when the database
+                    is locked (i.e. Slack is running). The copy is deleted after
+                    reading. Set to False to raise an error instead.
+  """
+  import leveldb
+  import pathlib
+  import shutil
+  import tempfile
+
+  path = _default_leveldb_path()
+  tmpdir = None
+
   db = None
   try:
-    db = leveldb.LevelDB(str(pathlib.Path(LEVELDB_PATH).expanduser()))
-  except Exception as e:
-    if "lock" in str(e):
-      raise RuntimeError("Slack's Local Storage database appears to be locked. Have you quit Slack?") from e
-    else:
-      raise
-  else:
+    try:
+      db = leveldb.LevelDB(str(path))
+    except Exception as e:
+      if "lock" in str(e) and copy_if_locked:
+        tmpdir = tempfile.mkdtemp(prefix="slacktokens-")
+        tmp_path = pathlib.Path(tmpdir) / path.name
+        shutil.copytree(path, tmp_path)
+        try:
+          db = leveldb.LevelDB(str(tmp_path))
+        except Exception as copy_e:
+          raise RuntimeError("Slack's Local Storage database could not be read even from a copy.") from copy_e
+      elif "lock" in str(e):
+        raise RuntimeError("Slack's Local Storage database appears to be locked. Have you quit Slack?") from e
+      else:
+        raise
+
     try:
       cfg = next(v for k,v in db.RangeIter() if bytearray(b'localConfig_v2') in k)
     except StopIteration as e:
@@ -127,15 +151,16 @@ def get_tokens():
     except Exception as e:
       raise RuntimeError("Slack's Local Storage not recognised: localConfig not in expected format. Aborting.") from e
 
-
     tokens = {}
     for v in d['teams'].values():
       tokens[v['url']] = { 'token': v['token'], 'name': v['name'] }
-  
+
     return tokens
   finally:
     if db:
       del db # attempt to clean up our lock
+    if tmpdir:
+      shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def get_cookie():
