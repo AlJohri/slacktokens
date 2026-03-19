@@ -91,26 +91,37 @@ def get_tokens_and_cookie():
   """Return a dictionary containing the Slack personal tokens and cookie."""
   return { 'tokens': get_tokens(), 'cookie': get_cookie() }
 
-def get_tokens():
-  """Return a dictionary containing the token and name for each Slack Workspace."""
-  import leveldb
+def _default_leveldb_path():
+  """Return the default platform-specific path to Slack's LevelDB directory."""
   import sys
   import pathlib
 
   if sys.platform == "darwin":
-    # leveldb location in MacOS depends on whether the application was installed from
-    # the App Store or direct download. To find out, we simply check for existence.
-    LEVELDB_PATH='~/Library/Application Support/Slack/Local Storage/leveldb'
-    if not pathlib.Path(LEVELDB_PATH).expanduser().exists():
-      LEVELDB_PATH='~/Library/Containers/com.tinyspeck.slackmacgap/Data/Library/Application Support/Slack/Local Storage/leveldb'
+    path = pathlib.Path('~/Library/Application Support/Slack/Local Storage/leveldb').expanduser()
+    if not path.exists():
+      path = pathlib.Path('~/Library/Containers/com.tinyspeck.slackmacgap/Data/Library/Application Support/Slack/Local Storage/leveldb').expanduser()
+    return path
   elif sys.platform.startswith("linux"):
-    LEVELDB_PATH='~/.config/Slack/Local Storage/leveldb'
+    return pathlib.Path('~/.config/Slack/Local Storage/leveldb').expanduser()
   else:
     raise OSError("slacktokens only works on macOS or Linux.")
 
+def get_tokens(leveldb_path=None):
+  """Return a dictionary containing the token and name for each Slack Workspace.
+
+  Args:
+    leveldb_path: Path to Slack's LevelDB directory. Defaults to the standard
+                  platform-specific location. Override this if the DB is locked
+                  (e.g. pass a path to a copy made while Slack is running).
+  """
+  import leveldb
+  import pathlib
+
+  path = pathlib.Path(leveldb_path) if leveldb_path is not None else _default_leveldb_path()
+
   db = None
   try:
-    db = leveldb.LevelDB(str(pathlib.Path(LEVELDB_PATH).expanduser()))
+    db = leveldb.LevelDB(str(path))
   except Exception as e:
     if "lock" in str(e):
       raise RuntimeError("Slack's Local Storage database appears to be locked. Have you quit Slack?") from e
