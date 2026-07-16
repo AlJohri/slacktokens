@@ -9,6 +9,7 @@ version = "0.2.5"
 dependencies = [
 	"leveldb==0.201",
     "pycookiecheat",
+    "cryptography",
 ]
 # Python 3.12 deprecates "PyUnicode_AS_UNICODE", which python-leveldb relies on. I
 # haven't found a workaround, so just require 3.11 for now. I've read "Should You Use
