@@ -140,8 +140,86 @@ def get_tokens():
 
 def get_cookie():
   """Return a dictionary containing the name and value of the authentication cookie."""
-  import pycookiecheat
+  import sys
 
+  # On Linux, decrypt the cookie ourselves via the libsecret `secret-tool` CLI
+  # instead of going through pycookiecheat. pycookiecheat's only reliable Linux
+  # keyring path needs system PyGObject (`gi`), which can't be pip-installed into
+  # an isolated venv (e.g. `uv run`, pipx). Without it, pycookiecheat silently
+  # falls back to the hard-coded "peanuts" default key and mis-decrypts the
+  # cookie (UnicodeDecodeError on the resulting garbage). secret-tool reads the
+  # real "Slack Safe Storage" secret directly, so this works everywhere the
+  # GNOME keyring / libsecret is present.
+  if sys.platform.startswith("linux"):
+    return { 'name': 'd', 'value': _get_linux_cookie_value() }
+
+  # macOS: pycookiecheat talks to the Keychain via the `security` binary, which
+  # works fine without any extra system bindings.
+  import pycookiecheat
   cookies = pycookiecheat.chrome_cookies("http://slack.com", browser="Slack")
-  
+
   return { 'name': 'd', 'value': cookies['d'] }
+
+
+def _get_linux_cookie_value():
+  """Decrypt Slack's `d` cookie on Linux using the libsecret keyring secret.
+
+  Slack (Electron/Chromium) stores the `d` cookie AES-128-CBC encrypted in
+  ~/.config/Slack/Cookies. The key is PBKDF2(secret, "saltysalt", 1, 16) where
+  `secret` is the "Slack Safe Storage" password in the login keyring. Newer
+  Chromium (cookie DB version >= 24) also prepends a 32-byte SHA256(host_key)
+  to the plaintext, which must be stripped.
+  """
+  import hashlib
+  import pathlib
+  import shutil
+  import sqlite3
+  import subprocess
+  import tempfile
+  from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+  if not shutil.which("secret-tool"):
+    raise RuntimeError("`secret-tool` not found. Install libsecret-tools (Debian/Ubuntu) "
+                       "or libsecret (Arch/Fedora) to read the Slack keyring secret.")
+  try:
+    password = subprocess.check_output(
+      ["secret-tool", "lookup", "application", "Slack"], stderr=subprocess.DEVNULL)
+  except subprocess.CalledProcessError:
+    password = b""
+  if not password:
+    raise RuntimeError("No 'Slack Safe Storage' secret found in the keyring. Has the Slack "
+                       "desktop app run at least once, and is your login keyring unlocked?")
+
+  cookies_db = pathlib.Path("~/.config/Slack/Cookies").expanduser()
+  if not cookies_db.exists():
+    raise RuntimeError(f"Slack cookie database not found at {cookies_db}.")
+
+  key = hashlib.pbkdf2_hmac("sha1", password, b"saltysalt", 1, 16)
+  with tempfile.TemporaryDirectory(prefix="slacktokens-") as tmp:
+    tmp_db = pathlib.Path(tmp) / "Cookies"
+    shutil.copy2(cookies_db, tmp_db)  # copy to dodge the running app's SQLite lock
+    con = sqlite3.connect(str(tmp_db))
+    try:
+      row = con.execute("SELECT encrypted_value FROM cookies "
+                        "WHERE name='d' AND host_key='.slack.com'").fetchone()
+      ver = con.execute("SELECT value FROM meta WHERE key='version'").fetchone()
+    finally:
+      con.close()
+
+  if not row:
+    raise RuntimeError("No `d` cookie for .slack.com found. Sign in to the Slack app.")
+  encrypted = row[0]
+  db_version = int(ver[0]) if ver else 0
+
+  if encrypted[:3] not in (b"v10", b"v11"):
+    raise RuntimeError(f"Unexpected cookie encryption prefix {encrypted[:3]!r}; expected v10/v11.")
+  decryptor = Cipher(algorithms.AES(key), modes.CBC(b" " * 16)).decryptor()
+  decrypted = decryptor.update(encrypted[3:]) + decryptor.finalize()
+  decrypted = decrypted[:-decrypted[-1]]  # strip PKCS7 padding
+  if db_version >= 24:
+    decrypted = decrypted[32:]  # strip SHA256(host_key) domain-bound prefix
+  try:
+    return decrypted.decode("utf8")
+  except UnicodeDecodeError as e:
+    raise RuntimeError("Decrypted cookie is not valid text (wrong key). If you recently "
+                       "reinstalled Slack, unlock your login keyring and retry.") from e
